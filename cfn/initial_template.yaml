@@ -1,0 +1,154 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Full Fraud Detection Platform Infrastructure
+
+Resources:
+
+  FraudEventTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: FraudEventData
+      BillingMode: PAYPERREQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  RawDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: fraud-platform-raw-data
+
+  ProcessedDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: fraud-platform-processed-data
+
+  FraudLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FraudLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FraudLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:* 
+                  - s3:* 
+                  - logs:* 
+                  - firehose:* 
+                Resource: '*'
+
+  FraudStreamProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FraudStreamProcessor
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Role: !GetAtt FraudLambdaRole.Arn
+
+  FraudStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt FraudEventTable.StreamArn
+      FunctionName: !GetAtt FraudStreamProcessor.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      Enabled: true
+
+  FirehoseToS3:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: fraud-firehose-to-s3
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt RawDataBucket.Arn
+        RoleARN: !GetAtt FraudLambdaRole.Arn
+
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SageMakerFraudExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+
+  FraudModel:
+    Type: AWS::SageMaker::Model
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerExecutionRole.Arn
+      ModelName: FraudDetectionModel
+
+  FraudEndpointConfig:
+    Type: AWS::SageMaker::EndpointConfig
+    Properties:
+      EndpointConfigName: FraudEndpointConfig
+      ProductionVariants:
+        - InitialInstanceCount: 1
+          InstanceType: ml.t2.medium
+          ModelName: !Ref FraudModel
+          VariantName: AllTraffic
+
+  FraudEndpoint:
+    Type: AWS::SageMaker::Endpoint
+    Properties:
+      EndpointName: FraudDetectionEndpoint
+      EndpointConfigName: !Ref FraudEndpointConfig
+
+  FraudAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: FraudDetectionAPI
+      Description: API to fetch fraud metrics and trust scores
+
+  GlueFraudJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: fraud-etl-job
+      Role: !GetAtt SageMakerExecutionRole.Arn
+      Command:
+        Name: glueetl
+        ScriptLocation: s3://fraud-platform-raw-data/scripts/etl-script.py
+        PythonVersion: 3
+
+Outputs:
+  DynamoDBTableName:
+    Value: !Ref FraudEventTable
+
+  RawDataBucketName:
+    Value: !Ref RawDataBucket
+
+  ProcessedDataBucketName:
+    Value: !Ref ProcessedDataBucket
+
+  FirehoseStreamName:
+    Value: !Ref FirehoseToS3
+
+  SageMakerModelName:
+    Value: !Ref FraudModel
+
+  SageMakerEndpoint:
+    Value: !Ref FraudEndpoint
+
+  FraudAPIId:
+    Value: !Ref FraudAPI
